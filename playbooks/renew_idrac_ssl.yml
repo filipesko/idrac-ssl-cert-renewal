@@ -13,6 +13,8 @@
     idrac_cert_common_name_effective: "{{ idrac_cert_common_name | default(inventory_hostname) }}"
     idrac_cert_sans_effective: "{{ idrac_cert_subject_alt_name | default([idrac_cert_common_name_effective, idrac_ip]) | unique }}"
     adcs_web_base_url: "{{ adcs_web_enrollment_url | regex_replace('/+$', '') }}"
+    adcs_web_csr_path: "{{ adcs_web_work_dir }}\\{{ idrac_cert_file_stem }}.csr"
+    adcs_web_cert_path: "{{ adcs_web_work_dir }}\\{{ idrac_cert_file_stem }}.pem"
     signed_cert_local_path: "{{ certificate_work_dir }}/{{ idrac_cert_file_stem }}.pem"
 
   tasks:
@@ -23,12 +25,8 @@
           - idrac_auth_password | length > 0
           - adcs_web_enrollment_url is defined
           - adcs_template is defined
-          - >
-            (adcs_web_use_gssapi | default(false) | bool) or
-            (
-              adcs_web_username | default('', true) | length > 0 and
-              adcs_web_password | default('', true) | length > 0
-            )
+          - adcs_web_enrollment_host is defined
+          - adcs_web_work_dir is defined
           - idrac_cert_country_code is defined
           - idrac_cert_state_name is defined
           - idrac_cert_locality_name is defined
@@ -36,7 +34,7 @@
           - idrac_cert_organization_unit is defined
         fail_msg: >-
           Define iDRAC credentials, AD CS enrollment settings, and CSR subject
-          values. See group_vars/idrac.example.yml.
+          values. See inventory/group_vars/idrac.example.yml.
       no_log: true
 
     - name: Create local certificate work directory
@@ -84,88 +82,114 @@
       ansible.builtin.set_fact:
         csr_local_path: "{{ idrac_csr.certificate_path }}"
 
-    - name: Open AD CS Web Enrollment request page
-      ansible.builtin.uri:
-        url: "{{ adcs_web_base_url }}/certrqxt.asp"
-        method: GET
-        url_username: "{{ adcs_web_username | default(omit, true) }}"
-        url_password: "{{ adcs_web_password | default(omit, true) }}"
-        force_basic_auth: "{{ adcs_web_force_basic_auth | default(true) | bool }}"
-        use_gssapi: "{{ adcs_web_use_gssapi | default(false) | bool }}"
-        validate_certs: "{{ adcs_web_validate_certs | default(true) | bool }}"
-        ca_path: "{{ adcs_web_ca_path | default(omit, true) }}"
-        timeout: "{{ adcs_web_timeout | default(60) }}"
-        return_content: false
-        status_code:
-          - 200
-      register: adcs_web_session
-      no_log: "{{ adcs_web_no_log | default(true) | bool }}"
+    - name: Create AD CS Web Enrollment work directory
+      ansible.windows.win_file:
+        path: "{{ adcs_web_work_dir }}"
+        state: directory
+      delegate_to: "{{ adcs_web_enrollment_host }}"
 
-    - name: Submit CSR to AD CS Web Enrollment
-      ansible.builtin.uri:
-        url: "{{ adcs_web_base_url }}/certfnsh.asp"
-        method: POST
-        url_username: "{{ adcs_web_username | default(omit, true) }}"
-        url_password: "{{ adcs_web_password | default(omit, true) }}"
-        force_basic_auth: "{{ adcs_web_force_basic_auth | default(true) | bool }}"
-        use_gssapi: "{{ adcs_web_use_gssapi | default(false) | bool }}"
-        validate_certs: "{{ adcs_web_validate_certs | default(true) | bool }}"
-        ca_path: "{{ adcs_web_ca_path | default(omit, true) }}"
-        timeout: "{{ adcs_web_timeout | default(60) }}"
-        headers:
-          Cookie: "{{ adcs_web_session.cookies_string | default('') }}"
-          Referer: "{{ adcs_web_base_url }}/certrqxt.asp"
-        body_format: form-urlencoded
-        body:
-          Mode: newreq
-          CertRequest: "{{ lookup('ansible.builtin.file', csr_local_path) }}"
-          CertAttrib: "CertificateTemplate:{{ adcs_template }}"
-          TargetStoreFlags: "0"
-          SaveCert: "yes"
-        return_content: true
-        status_code:
-          - 200
+    - name: Remove stale AD CS Web Enrollment output
+      ansible.windows.win_file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ adcs_web_csr_path }}"
+        - "{{ adcs_web_cert_path }}"
+      delegate_to: "{{ adcs_web_enrollment_host }}"
+
+    - name: Copy CSR to AD CS Web Enrollment client
+      ansible.windows.win_copy:
+        src: "{{ csr_local_path }}"
+        dest: "{{ adcs_web_csr_path }}"
+      delegate_to: "{{ adcs_web_enrollment_host }}"
+
+    - name: Submit CSR to AD CS Web Enrollment with NTLM
+      ansible.windows.win_shell: |
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference = 'SilentlyContinue'
+
+        $baseUrl = '{{ adcs_web_base_url }}'
+        $csrPath = '{{ adcs_web_csr_path }}'
+        $certPath = '{{ adcs_web_cert_path }}'
+        $template = '{{ adcs_template }}'
+        $timeoutSec = {{ adcs_web_timeout | default(60) | int }}
+        $validateCerts = [System.Convert]::ToBoolean('{{ adcs_web_validate_certs | default(true) | bool }}')
+        $usernameBytes = [System.Convert]::FromBase64String('{{ adcs_web_username | default('', true) | b64encode }}')
+        $passwordBytes = [System.Convert]::FromBase64String('{{ adcs_web_password | default('', true) | b64encode }}')
+        $username = [System.Text.Encoding]::UTF8.GetString($usernameBytes)
+        $password = [System.Text.Encoding]::UTF8.GetString($passwordBytes)
+
+        if (-not $validateCerts) {
+          [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+        }
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+
+        $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+        $commonParams = @{
+          WebSession = $session
+          TimeoutSec = $timeoutSec
+          UseBasicParsing = $true
+        }
+
+        if ([string]::IsNullOrWhiteSpace($username) -or [string]::IsNullOrWhiteSpace($password)) {
+          $commonParams.UseDefaultCredentials = $true
+        } else {
+          $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
+          $commonParams.Credential = New-Object System.Management.Automation.PSCredential($username, $securePassword)
+        }
+
+        Invoke-WebRequest @commonParams -Uri "$baseUrl/certrqxt.asp" -Method Get | Out-Null
+
+        $csr = Get-Content -Path $csrPath -Raw
+        $form = @{
+          Mode = 'newreq'
+          CertRequest = $csr
+          CertAttrib = "CertificateTemplate:$template"
+          TargetStoreFlags = '0'
+          SaveCert = 'yes'
+        }
+
+        $submitResponse = Invoke-WebRequest @commonParams `
+          -Uri "$baseUrl/certfnsh.asp" `
+          -Method Post `
+          -ContentType 'application/x-www-form-urlencoded' `
+          -Body $form
+
+        $submitHtml = [string]$submitResponse.Content
+        if ($submitHtml -notmatch '[Rr]eqID=([0-9]+)' -or -not $submitHtml.ToLowerInvariant().Contains('certnew.cer')) {
+          throw 'AD CS Web Enrollment did not return an issued certificate download link. The request may be pending, denied, or require CA manager approval.'
+        }
+
+        $requestId = $Matches[1]
+        Invoke-WebRequest @commonParams `
+          -Uri "$baseUrl/certnew.cer?ReqID=$requestId&Enc=b64" `
+          -Method Get `
+          -OutFile $certPath
+
+        $certificate = Get-Content -Path $certPath -Raw
+        if (-not $certificate.Contains('-----BEGIN CERTIFICATE-----') -or -not $certificate.Contains('-----END CERTIFICATE-----')) {
+          throw "AD CS Web Enrollment did not return a PEM certificate for request $requestId."
+        }
+
+        [pscustomobject]@{
+          RequestId = $requestId
+          CertificatePath = $certPath
+        } | ConvertTo-Json -Compress
       register: adcs_web_submit
       changed_when: true
+      delegate_to: "{{ adcs_web_enrollment_host }}"
       no_log: "{{ adcs_web_no_log | default(true) | bool }}"
-
-    - name: Extract AD CS request ID
-      ansible.builtin.set_fact:
-        adcs_request_id_matches: "{{ adcs_web_submit.content | regex_findall('[Rr]eqID=([0-9]+)') }}"
-
-    - name: Ensure AD CS issued the certificate
-      ansible.builtin.assert:
-        that:
-          - adcs_request_id_matches | length > 0
-          - "'certnew.cer' in (adcs_web_submit.content | lower)"
-        fail_msg: >-
-          AD CS Web Enrollment did not return an issued certificate download
-          link. The request may be pending, denied, or the selected template may
-          require CA manager approval.
 
     - name: Remember AD CS request ID
       ansible.builtin.set_fact:
-        adcs_request_id: "{{ adcs_request_id_matches | first }}"
+        adcs_request_id: "{{ (adcs_web_submit.stdout | from_json).RequestId }}"
 
-    - name: Download signed certificate from AD CS Web Enrollment
-      ansible.builtin.uri:
-        url: "{{ adcs_web_base_url }}/certnew.cer?ReqID={{ adcs_request_id }}&Enc=b64"
-        method: GET
-        url_username: "{{ adcs_web_username | default(omit, true) }}"
-        url_password: "{{ adcs_web_password | default(omit, true) }}"
-        force_basic_auth: "{{ adcs_web_force_basic_auth | default(true) | bool }}"
-        use_gssapi: "{{ adcs_web_use_gssapi | default(false) | bool }}"
-        validate_certs: "{{ adcs_web_validate_certs | default(true) | bool }}"
-        ca_path: "{{ adcs_web_ca_path | default(omit, true) }}"
-        timeout: "{{ adcs_web_timeout | default(60) }}"
-        headers:
-          Cookie: "{{ adcs_web_session.cookies_string | default('') }}"
-          Referer: "{{ adcs_web_base_url }}/certfnsh.asp"
+    - name: Fetch signed certificate to controller
+      ansible.builtin.fetch:
+        src: "{{ adcs_web_cert_path }}"
         dest: "{{ signed_cert_local_path }}"
-        mode: "0600"
-        status_code:
-          - 200
-      no_log: "{{ adcs_web_no_log | default(true) | bool }}"
+        flat: true
+      delegate_to: "{{ adcs_web_enrollment_host }}"
 
     - name: Verify downloaded certificate is PEM encoded
       ansible.builtin.assert:

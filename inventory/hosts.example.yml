@@ -9,3 +9,13 @@ all:
           idrac_cert_subject_alt_name:
             - server01-idrac.example.com
             - 192.0.2.10
+
+    adcs_web_clients:
+      hosts:
+        adcs-web-client01:
+          ansible_host: adcs-web-client01.example.com
+          ansible_connection: winrm
+          ansible_user: CONTOSO\ansible_adcs_enroll
+          ansible_password: "{{ lookup('ansible.builtin.env', 'ADCS_WINRM_PASSWORD') }}"
+          ansible_winrm_transport: ntlm
+          ansible_winrm_server_cert_validation: ignore

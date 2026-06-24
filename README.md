@@ -13,14 +13,13 @@ The iDRAC private key stays on the iDRAC because the CSR is generated there.
 
 - Ansible controller with Python 3.
 - Network access from the controller to each iDRAC.
-- Network access from the controller to the AD CS Web Enrollment `/certsrv`
-  site.
+- Network access from the controller to a Windows enrollment client over WinRM.
+- Network access from the Windows enrollment client to the AD CS Web Enrollment
+  `/certsrv` site.
 - An AD CS certificate template, such as `WebServer`, configured to issue
   server-authentication certificates and accept the subject/SAN values supplied
   in the CSR.
-- AD CS Web Enrollment authentication that the Ansible controller can use:
-  Basic over HTTPS, or Kerberos/GSSAPI with the Python `gssapi` library
-  available to Ansible.
+- AD CS Web Enrollment with Windows authentication/NTLM enabled.
 
 Install the required collections:
 
@@ -34,7 +33,7 @@ Copy the examples and edit them for your environment:
 
 ```bash
 cp inventory/hosts.example.yml inventory/hosts.yml
-cp group_vars/idrac.example.yml group_vars/idrac.yml
+cp inventory/group_vars/idrac.example.yml inventory/group_vars/idrac.yml
 ```
 
 Recommended secret handling:
@@ -42,23 +41,25 @@ Recommended secret handling:
 ```bash
 export IDRAC_USERNAME=root
 export IDRAC_PASSWORD='...'
+export ADCS_WINRM_PASSWORD='...'
 export ADCS_WEB_USERNAME='CONTOSO\ansible_adcs_enroll'
 export ADCS_WEB_PASSWORD='...'
 ```
 
 You can also move secrets into Ansible Vault instead of environment variables.
 
-Key settings in `group_vars/idrac.yml`:
+Key settings in `inventory/group_vars/idrac.yml`:
 
 - `adcs_web_enrollment_url`: AD CS Web Enrollment URL, for example
   `https://ca01.contoso.com/certsrv`.
 - `adcs_template`: certificate template name, for example `WebServer`.
+- `adcs_web_enrollment_host`: inventory name of the Windows host that runs the
+  NTLM Web Enrollment HTTP requests.
 - `adcs_web_username` and `adcs_web_password`: credentials used by the
-  controller when posting the CSR to Web Enrollment.
-- `adcs_web_validate_certs`: whether the controller validates the TLS
-  certificate on the Web Enrollment site.
-- `adcs_web_ca_path`: optional PEM CA bundle for validating the Web Enrollment
-  site certificate.
+  Windows enrollment client when posting the CSR to Web Enrollment. Leave both
+  empty only if your WinRM session can delegate usable credentials to `/certsrv`.
+- `adcs_web_validate_certs`: whether the Windows enrollment client validates
+  the TLS certificate on the Web Enrollment site.
 - `idrac_cert_*`: CSR subject fields.
 
 Per-host overrides belong in `inventory/hosts.yml`, especially:
@@ -66,6 +67,10 @@ Per-host overrides belong in `inventory/hosts.yml`, especially:
 - `ansible_host`: iDRAC IP address or DNS name.
 - `idrac_cert_common_name`: certificate common name.
 - `idrac_cert_subject_alt_name`: DNS names and IP addresses for SANs.
+
+The group variables live under `inventory/group_vars/` because the documented
+run command uses `-i inventory/hosts.yml`. With that layout, Ansible loads vars
+from the inventory directory.
 
 ## Run
 
@@ -87,10 +92,13 @@ controller. The directory is ignored by git.
 - The playbook assumes AD CS auto-issues the request. If your template requires
   approval, Web Enrollment will not return an issued certificate download link
   and the playbook stops before importing anything to iDRAC.
-- `ansible.builtin.uri` does not support NTLM authentication. If your `/certsrv`
-  site only allows NTLM, either enable Basic over HTTPS, enable Kerberos/GSSAPI
-  from the controller, or run this workflow from a Windows automation host with
-  an implementation that can use Windows integrated credentials.
+- AD CS Web Enrollment is submitted with PowerShell `Invoke-WebRequest` on the
+  Windows enrollment client because `ansible.builtin.uri` cannot authenticate to
+  NTLM-only `/certsrv` sites.
+- Explicit `adcs_web_username` and `adcs_web_password` avoid the WinRM
+  double-hop problem. If you omit them, the PowerShell task uses the WinRM
+  session credentials and your environment must allow those credentials to reach
+  the AD CS Web Enrollment site.
 - `idrac_validate_certs` defaults to `false` in the example because many iDRACs
   start with self-signed certificates. Set it to `true` and provide `idrac_ca_path`
   once your environment can validate the current iDRAC certificate.

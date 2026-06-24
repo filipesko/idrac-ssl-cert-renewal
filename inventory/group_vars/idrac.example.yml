@@ -1,5 +1,5 @@
 ---
-# Copy this file to group_vars/idrac.yml and adjust it for your environment.
+# Copy this file to inventory/group_vars/idrac.yml and adjust it for your environment.
 
 idrac_user: "{{ lookup('ansible.builtin.env', 'IDRAC_USERNAME') }}"
 idrac_password: "{{ lookup('ansible.builtin.env', 'IDRAC_PASSWORD') }}"
@@ -12,10 +12,13 @@ idrac_reset_wait: 900
 # AD CS Web Enrollment endpoint. This is the IIS /certsrv application.
 adcs_web_enrollment_url: https://ca01.contoso.com/certsrv
 adcs_template: WebServer
+
+# AD CS Web Enrollment only supports NTLM in this environment, so the /certsrv
+# HTTP workflow is run from this Windows host using PowerShell Invoke-WebRequest.
+adcs_web_enrollment_host: adcs-web-client01
+adcs_web_work_dir: C:\Windows\Temp\idrac-certificate-renewal
 adcs_web_username: "{{ lookup('ansible.builtin.env', 'ADCS_WEB_USERNAME') }}"
 adcs_web_password: "{{ lookup('ansible.builtin.env', 'ADCS_WEB_PASSWORD') }}"
-adcs_web_force_basic_auth: true
-adcs_web_use_gssapi: false
 adcs_web_validate_certs: true
 adcs_web_timeout: 60
 
