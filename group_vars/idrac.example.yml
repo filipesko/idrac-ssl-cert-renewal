@@ -1,0 +1,31 @@
+---
+# Copy this file to group_vars/idrac.yml and adjust it for your environment.
+
+idrac_user: "{{ lookup('ansible.builtin.env', 'IDRAC_USERNAME') }}"
+idrac_password: "{{ lookup('ansible.builtin.env', 'IDRAC_PASSWORD') }}"
+idrac_validate_certs: false
+idrac_port: 443
+idrac_timeout: 60
+idrac_reset_after_import: true
+idrac_reset_wait: 900
+
+# AD CS Web Enrollment endpoint. This is the IIS /certsrv application.
+adcs_web_enrollment_url: https://ca01.contoso.com/certsrv
+adcs_template: WebServer
+adcs_web_username: "{{ lookup('ansible.builtin.env', 'ADCS_WEB_USERNAME') }}"
+adcs_web_password: "{{ lookup('ansible.builtin.env', 'ADCS_WEB_PASSWORD') }}"
+adcs_web_force_basic_auth: true
+adcs_web_use_gssapi: false
+adcs_web_validate_certs: true
+adcs_web_timeout: 60
+
+# CSR subject defaults. Override per-host in inventory when needed.
+idrac_cert_country_code: US
+idrac_cert_state_name: Washington
+idrac_cert_locality_name: Redmond
+idrac_cert_organization_name: Contoso
+idrac_cert_organization_unit: Infrastructure
+idrac_cert_email_address: infra-pki@example.com
+
+# Local controller directory for generated CSRs and signed certificates.
+certificate_work_root: "{{ playbook_dir }}/../artifacts"

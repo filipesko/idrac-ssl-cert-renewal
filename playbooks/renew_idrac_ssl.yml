@@ -1,0 +1,201 @@
+---
+- name: Renew Dell iDRAC HTTPS certificate with AD CS
+  hosts: idrac
+  gather_facts: false
+  connection: local
+
+  vars:
+    idrac_ip: "{{ ansible_host | default(inventory_hostname) }}"
+    idrac_auth_user: "{{ idrac_user | default(lookup('ansible.builtin.env', 'IDRAC_USERNAME'), true) }}"
+    idrac_auth_password: "{{ idrac_password | default(lookup('ansible.builtin.env', 'IDRAC_PASSWORD'), true) }}"
+    idrac_cert_file_stem: "{{ inventory_hostname | regex_replace('[^A-Za-z0-9_.-]', '_') }}"
+    certificate_work_dir: "{{ certificate_work_root | default(playbook_dir ~ '/../artifacts') }}/{{ idrac_cert_file_stem }}"
+    idrac_cert_common_name_effective: "{{ idrac_cert_common_name | default(inventory_hostname) }}"
+    idrac_cert_sans_effective: "{{ idrac_cert_subject_alt_name | default([idrac_cert_common_name_effective, idrac_ip]) | unique }}"
+    adcs_web_base_url: "{{ adcs_web_enrollment_url | regex_replace('/+$', '') }}"
+    signed_cert_local_path: "{{ certificate_work_dir }}/{{ idrac_cert_file_stem }}.pem"
+
+  tasks:
+    - name: Validate required iDRAC and AD CS inputs
+      ansible.builtin.assert:
+        that:
+          - idrac_auth_user | length > 0
+          - idrac_auth_password | length > 0
+          - adcs_web_enrollment_url is defined
+          - adcs_template is defined
+          - >
+            (adcs_web_use_gssapi | default(false) | bool) or
+            (
+              adcs_web_username | default('', true) | length > 0 and
+              adcs_web_password | default('', true) | length > 0
+            )
+          - idrac_cert_country_code is defined
+          - idrac_cert_state_name is defined
+          - idrac_cert_locality_name is defined
+          - idrac_cert_organization_name is defined
+          - idrac_cert_organization_unit is defined
+        fail_msg: >-
+          Define iDRAC credentials, AD CS enrollment settings, and CSR subject
+          values. See group_vars/idrac.example.yml.
+      no_log: true
+
+    - name: Create local certificate work directory
+      ansible.builtin.file:
+        path: "{{ certificate_work_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: Build CSR parameters
+      ansible.builtin.set_fact:
+        idrac_csr_params: >-
+          {{
+            {
+              'common_name': idrac_cert_common_name_effective,
+              'country_code': idrac_cert_country_code,
+              'state_name': idrac_cert_state_name,
+              'locality_name': idrac_cert_locality_name,
+              'organization_name': idrac_cert_organization_name,
+              'organization_unit': idrac_cert_organization_unit,
+              'subject_alt_name': idrac_cert_sans_effective
+            }
+            | combine(
+              (idrac_cert_email_address | default('') | length > 0)
+              | ternary({'email_address': idrac_cert_email_address}, {})
+            )
+          }}
+
+    - name: Generate HTTPS CSR on iDRAC
+      dellemc.openmanage.idrac_certificates:
+        idrac_ip: "{{ idrac_ip }}"
+        idrac_port: "{{ idrac_port | default(443) }}"
+        idrac_user: "{{ idrac_auth_user }}"
+        idrac_password: "{{ idrac_auth_password }}"
+        validate_certs: "{{ idrac_validate_certs | default(true) | bool }}"
+        ca_path: "{{ idrac_ca_path | default(omit, true) }}"
+        timeout: "{{ idrac_timeout | default(60) }}"
+        command: generate_csr
+        certificate_type: HTTPS
+        certificate_path: "{{ certificate_work_dir }}"
+        cert_params: "{{ idrac_csr_params }}"
+      register: idrac_csr
+      no_log: "{{ idrac_no_log | default(true) | bool }}"
+
+    - name: Remember generated CSR path
+      ansible.builtin.set_fact:
+        csr_local_path: "{{ idrac_csr.certificate_path }}"
+
+    - name: Open AD CS Web Enrollment request page
+      ansible.builtin.uri:
+        url: "{{ adcs_web_base_url }}/certrqxt.asp"
+        method: GET
+        url_username: "{{ adcs_web_username | default(omit, true) }}"
+        url_password: "{{ adcs_web_password | default(omit, true) }}"
+        force_basic_auth: "{{ adcs_web_force_basic_auth | default(true) | bool }}"
+        use_gssapi: "{{ adcs_web_use_gssapi | default(false) | bool }}"
+        validate_certs: "{{ adcs_web_validate_certs | default(true) | bool }}"
+        ca_path: "{{ adcs_web_ca_path | default(omit, true) }}"
+        timeout: "{{ adcs_web_timeout | default(60) }}"
+        return_content: false
+        status_code:
+          - 200
+      register: adcs_web_session
+      no_log: "{{ adcs_web_no_log | default(true) | bool }}"
+
+    - name: Submit CSR to AD CS Web Enrollment
+      ansible.builtin.uri:
+        url: "{{ adcs_web_base_url }}/certfnsh.asp"
+        method: POST
+        url_username: "{{ adcs_web_username | default(omit, true) }}"
+        url_password: "{{ adcs_web_password | default(omit, true) }}"
+        force_basic_auth: "{{ adcs_web_force_basic_auth | default(true) | bool }}"
+        use_gssapi: "{{ adcs_web_use_gssapi | default(false) | bool }}"
+        validate_certs: "{{ adcs_web_validate_certs | default(true) | bool }}"
+        ca_path: "{{ adcs_web_ca_path | default(omit, true) }}"
+        timeout: "{{ adcs_web_timeout | default(60) }}"
+        headers:
+          Cookie: "{{ adcs_web_session.cookies_string | default('') }}"
+          Referer: "{{ adcs_web_base_url }}/certrqxt.asp"
+        body_format: form-urlencoded
+        body:
+          Mode: newreq
+          CertRequest: "{{ lookup('ansible.builtin.file', csr_local_path) }}"
+          CertAttrib: "CertificateTemplate:{{ adcs_template }}"
+          TargetStoreFlags: "0"
+          SaveCert: "yes"
+        return_content: true
+        status_code:
+          - 200
+      register: adcs_web_submit
+      changed_when: true
+      no_log: "{{ adcs_web_no_log | default(true) | bool }}"
+
+    - name: Extract AD CS request ID
+      ansible.builtin.set_fact:
+        adcs_request_id_matches: "{{ adcs_web_submit.content | regex_findall('[Rr]eqID=([0-9]+)') }}"
+
+    - name: Ensure AD CS issued the certificate
+      ansible.builtin.assert:
+        that:
+          - adcs_request_id_matches | length > 0
+          - "'certnew.cer' in (adcs_web_submit.content | lower)"
+        fail_msg: >-
+          AD CS Web Enrollment did not return an issued certificate download
+          link. The request may be pending, denied, or the selected template may
+          require CA manager approval.
+
+    - name: Remember AD CS request ID
+      ansible.builtin.set_fact:
+        adcs_request_id: "{{ adcs_request_id_matches | first }}"
+
+    - name: Download signed certificate from AD CS Web Enrollment
+      ansible.builtin.uri:
+        url: "{{ adcs_web_base_url }}/certnew.cer?ReqID={{ adcs_request_id }}&Enc=b64"
+        method: GET
+        url_username: "{{ adcs_web_username | default(omit, true) }}"
+        url_password: "{{ adcs_web_password | default(omit, true) }}"
+        force_basic_auth: "{{ adcs_web_force_basic_auth | default(true) | bool }}"
+        use_gssapi: "{{ adcs_web_use_gssapi | default(false) | bool }}"
+        validate_certs: "{{ adcs_web_validate_certs | default(true) | bool }}"
+        ca_path: "{{ adcs_web_ca_path | default(omit, true) }}"
+        timeout: "{{ adcs_web_timeout | default(60) }}"
+        headers:
+          Cookie: "{{ adcs_web_session.cookies_string | default('') }}"
+          Referer: "{{ adcs_web_base_url }}/certfnsh.asp"
+        dest: "{{ signed_cert_local_path }}"
+        mode: "0600"
+        status_code:
+          - 200
+      no_log: "{{ adcs_web_no_log | default(true) | bool }}"
+
+    - name: Verify downloaded certificate is PEM encoded
+      ansible.builtin.assert:
+        that:
+          - "'-----BEGIN CERTIFICATE-----' in lookup('ansible.builtin.file', signed_cert_local_path)"
+          - "'-----END CERTIFICATE-----' in lookup('ansible.builtin.file', signed_cert_local_path)"
+        fail_msg: >-
+          AD CS Web Enrollment did not return a PEM certificate for request
+          {{ adcs_request_id }}. Check the CA request status and Web Enrollment
+          authentication settings.
+
+    - name: Install signed HTTPS certificate on iDRAC
+      dellemc.openmanage.idrac_certificates:
+        idrac_ip: "{{ idrac_ip }}"
+        idrac_port: "{{ idrac_port | default(443) }}"
+        idrac_user: "{{ idrac_auth_user }}"
+        idrac_password: "{{ idrac_auth_password }}"
+        validate_certs: "{{ idrac_validate_certs | default(true) | bool }}"
+        ca_path: "{{ idrac_ca_path | default(omit, true) }}"
+        timeout: "{{ idrac_timeout | default(60) }}"
+        command: import
+        certificate_type: HTTPS
+        certificate_path: "{{ signed_cert_local_path }}"
+        reset: "{{ idrac_reset_after_import | default(true) | bool }}"
+        wait: "{{ idrac_reset_wait | default(900) }}"
+      no_log: "{{ idrac_no_log | default(true) | bool }}"
+
+    - name: Show renewal result
+      ansible.builtin.debug:
+        msg:
+          - "Installed signed HTTPS certificate on {{ inventory_hostname }}."
+          - "CSR: {{ csr_local_path }}"
+          - "Certificate: {{ signed_cert_local_path }}"

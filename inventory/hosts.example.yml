@@ -1,0 +1,11 @@
+---
+all:
+  children:
+    idrac:
+      hosts:
+        server01-idrac:
+          ansible_host: 192.0.2.10
+          idrac_cert_common_name: server01-idrac.example.com
+          idrac_cert_subject_alt_name:
+            - server01-idrac.example.com
+            - 192.0.2.10
